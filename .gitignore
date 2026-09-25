@@ -1,0 +1,3 @@
+# Cache de datos sinteticos (~241 MB), se regenera con: python common.py
+datos/
+__pycache__/

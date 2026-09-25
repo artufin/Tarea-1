@@ -26,18 +26,46 @@ def run(X, y, p, b=common.B, seed=common.SEED):
       - bootstrap=True y max_samples=1.0 son los defaults y corresponden
         exactamente al Paso 2(i): sortear N indices con reemplazo.
       - random_state=seed para la reproducibilidad del item (c).
+
+    Nota para el item (b): como LinearRegression acepta sample_weight,
+    BaggingRegressor NO materializa X[idx]; convierte los indices sorteados en
+    conteos (np.bincount) y los pasa como pesos. Es el mismo truco que la
+    variante "pesos" de bs_numpy.py, pero el ajuste sigue siendo lstsq (SVD),
+    mas caro que resolver el sistema normal.
+
+    Con max_features=1.0 y bootstrap_features=False no se indexan columnas, asi
+    que cada coef_ ya viene en el orden original de X.
     """
-    # TODO: construir BaggingRegressor(estimator=LinearRegression(fit_intercept=False),
-    #       n_estimators=b, n_jobs=p, bootstrap=True, random_state=seed)
-    # TODO: .fit(X, y)
-    # TODO: apilar los coeficientes de cada sub-modelo desde bag.estimators_
-    raise NotImplementedError
+    bag = BaggingRegressor(
+        estimator=LinearRegression(fit_intercept=False),
+        n_estimators=b,
+        n_jobs=p,
+        bootstrap=True,
+        random_state=seed,
+    )
+    bag.fit(X, y)
+    return np.vstack([est.coef_ for est in bag.estimators_])
 
 
 def main():
     """Corrida individual de esta version: util para inspeccionarla sin el driver."""
-    # TODO: cargar datos, correr run() para un p dado, imprimir el IC y el tiempo.
-    pass
+    import argparse
+    import time
+
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    parser.add_argument("-p", type=int, default=1, help="numero de procesos (n_jobs)")
+    args = parser.parse_args()
+
+    X, y, beta_true = common.cargar_datos()
+    t0 = time.perf_counter()
+    betas = run(X, y, args.p)
+    tiempo = time.perf_counter() - t0
+
+    lo, hi = common.intervalo_confianza(betas)
+    cobertura = np.mean((lo <= beta_true) & (beta_true <= hi))
+    print(f"bs_auto  p={args.p}  tiempo={tiempo:.2f} s  cobertura IC95={cobertura:.3f}")
+    for j in range(3):
+        print(f"  beta_{j}: IC=[{lo[j]:+.4f}, {hi[j]:+.4f}]  verdadero={beta_true[j]:+.4f}")
 
 
 if __name__ == "__main__":

@@ -23,17 +23,45 @@ def _ajustar_resample(X, y, semilla):
 
     Retorna el vector de coeficientes (k+1,) de ese resample.
     """
-    # TODO: rng = np.random.default_rng(semilla)
-    # TODO: idx = rng.integers(0, X.shape[0], size=X.shape[0])   # N indices con reemplazo
-    # TODO: LinearRegression(fit_intercept=False).fit(X[idx], y[idx]).coef_
-    #
+    rng = np.random.default_rng(semilla)
+    n = X.shape[0]
+    idx = rng.integers(0, n, size=n)   # N indices con reemplazo
     # NOTA para el item (b) "comente sus mejoras": X[idx] materializa una copia
     # de ~241 MB por resample. Es el costo dominante de esta version y explica
-    # por que escala peor que bs_numpy.py con pesos.
-    raise NotImplementedError
+    # por que escala peor que bs_numpy.py con pesos. copy_X=False evita que
+    # LinearRegression haga una SEGUNDA copia de esa matriz (ya es nuestra).
+    modelo = LinearRegression(fit_intercept=False, copy_X=False)
+    return modelo.fit(X[idx], y[idx]).coef_
 
 
-def run(X, y, p, b=common.B, seed=common.SEED):
+def _ajustar_resample_pesos(X, y, semilla):
+    """
+    Mejora sobre _ajustar_resample: mismos indices, pero pasados como pesos.
+
+    Con la misma semilla sortea exactamente los mismos indices y los convierte
+    en conteos por fila (w = bincount(idx)), que LinearRegression recibe como
+    sample_weight. El problema de minimos cuadrados ponderado es identico al del
+    resample, y ademas las filas con w=0 (~36.8% de ellas) se descartan antes de
+    ajustar, asi que la matriz que llega a lstsq es ~37% mas chica que X[idx].
+    Es lo mismo que hace BaggingRegressor internamente (sin descartar filas).
+    """
+    rng = np.random.default_rng(semilla)
+    n = X.shape[0]
+    idx = rng.integers(0, n, size=n)
+    w = np.bincount(idx, minlength=n)
+    usadas = np.flatnonzero(w)
+    modelo = LinearRegression(fit_intercept=False, copy_X=False)
+    return modelo.fit(X[usadas], y[usadas], sample_weight=w[usadas]).coef_
+
+
+# Registro de variantes, para que bench.py pueda compararlas (item b).
+VARIANTES = {
+    "indices": _ajustar_resample,
+    "pesos": _ajustar_resample_pesos,
+}
+
+
+def run(X, y, p, b=common.B, seed=common.SEED, variante="pesos", backend="loky"):
     """
     Reparte los b resamples entre p procesos y retorna los coeficientes (b, k+1).
 
@@ -45,16 +73,38 @@ def run(X, y, p, b=common.B, seed=common.SEED):
         arreglos en vez de serializarlos hacia cada worker (clave en Windows,
         donde 'spawn' no permite copy-on-write).
     """
-    # TODO: semillas = common.semillas_resamples(seed, b)
-    # TODO: Parallel(n_jobs=p)(delayed(_ajustar_resample)(X, y, s) for s in semillas)
-    # TODO: np.vstack del resultado
-    raise NotImplementedError
+    fn = VARIANTES[variante]
+    semillas = common.semillas_resamples(seed, b)
+    # Parallel devuelve los resultados en el orden de las tareas (no en el orden
+    # en que terminan), asi que la fila i siempre corresponde a semillas[i].
+    betas = Parallel(n_jobs=p, backend=backend, batch_size=1)(
+        delayed(fn)(X, y, s) for s in semillas
+    )
+    return np.vstack(betas)
 
 
 def main():
     """Corrida individual de esta version."""
-    # TODO: cargar datos, correr run() para un p dado, imprimir el IC y el tiempo.
-    pass
+    import argparse
+    import time
+
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    parser.add_argument("-p", type=int, default=1, help="numero de procesos")
+    parser.add_argument("--variante", choices=list(VARIANTES), default="pesos")
+    parser.add_argument("--backend", choices=["loky", "multiprocessing"], default="loky")
+    args = parser.parse_args()
+
+    X, y, beta_true = common.cargar_datos()
+    t0 = time.perf_counter()
+    betas = run(X, y, args.p, variante=args.variante, backend=args.backend)
+    tiempo = time.perf_counter() - t0
+
+    lo, hi = common.intervalo_confianza(betas)
+    cobertura = np.mean((lo <= beta_true) & (beta_true <= hi))
+    print(f"bs_sklearn  p={args.p}  variante={args.variante}  backend={args.backend}  "
+          f"tiempo={tiempo:.2f} s  cobertura IC95={cobertura:.3f}")
+    for j in range(3):
+        print(f"  beta_{j}: IC=[{lo[j]:+.4f}, {hi[j]:+.4f}]  verdadero={beta_true[j]:+.4f}")
 
 
 if __name__ == "__main__":

@@ -44,9 +44,23 @@ def info_maquina():
     El item (f) pide declarar explicitamente el numero de cores logicos, y el
     item (j) necesita estos datos para justificar las diferencias entre maquinas.
     """
-    # TODO: retornar dict con procesador, os.cpu_count(), platform.platform(),
-    #       version de numpy y backend BLAS (via threadpoolctl.threadpool_info()).
-    raise NotImplementedError
+    from threadpoolctl import threadpool_info
+
+    blas = [
+        f"{pool.get('internal_api')} {pool.get('version')} "
+        f"({pool.get('num_threads')} threads, {pool.get('threading_layer', '-')})"
+        for pool in threadpool_info()
+        if pool.get("user_api") == "blas"
+    ]
+    return {
+        "maquina": nombre_maquina(),
+        "procesador": platform.processor() or platform.machine(),
+        "cores_logicos": os.cpu_count(),
+        "so": platform.platform(),
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+        "blas": "; ".join(blas) or "desconocido",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -64,10 +78,23 @@ def generar_datos(n=N, k=K, seed=SEED):
 
     Retorna X (n, k+1), y (n,), beta_true (k+1,).
     """
-    # TODO: usar np.random.default_rng(seed) --- no el API legacy np.random.seed.
-    # TODO: construir X con np.empty((n, k+1)) y llenar la columna 0 con unos,
-    #       para evitar un hstack que duplica los ~241 MB en memoria.
-    raise NotImplementedError
+    rng = np.random.default_rng(seed)
+
+    # (i) coeficientes verdaderos
+    beta_true = rng.standard_normal(k + 1)
+
+    # (ii) X se reserva una sola vez y se llena por bloques de filas: asi no se
+    # materializa un temporal n x k aparte (ni un hstack) que duplique la memoria.
+    X = np.empty((n, k + 1))
+    X[:, 0] = 1.0
+    bloque = 10_000
+    for i in range(0, n, bloque):
+        j = min(i + bloque, n)
+        X[i:j, 1:] = rng.standard_normal((j - i, k))
+
+    # (iii) salida con ruido
+    y = X @ beta_true + rng.standard_normal(n)
+    return X, y, beta_true
 
 
 def cargar_datos(regenerar=False):
@@ -79,10 +106,25 @@ def cargar_datos(regenerar=False):
         pueda comparar intervalos de confianza entre si;
       - regenerar 241 MB en cada corrida contaminaria los tiempos del item (f).
     """
-    # TODO: guardar/leer datos/X.npy, datos/y.npy, datos/beta_true.npy.
-    # TODO: considerar np.load(..., mmap_mode='r') para que joblib pueda
-    #       compartir la matriz entre procesos sin copiarla (relevante item d).
-    raise NotImplementedError
+    rutas = {nombre: os.path.join(DIR_DATOS, f"{nombre}.npy")
+             for nombre in ("X", "y", "beta_true")}
+
+    if regenerar or not all(os.path.exists(r) for r in rutas.values()):
+        os.makedirs(DIR_DATOS, exist_ok=True)
+        X, y, beta_true = generar_datos()
+        np.save(rutas["X"], X)
+        np.save(rutas["y"], y)
+        np.save(rutas["beta_true"], beta_true)
+        del X, y, beta_true
+
+    # X se abre como memmap de solo lectura: joblib reconoce np.memmap y a los
+    # workers les envia solo la ruta del archivo (no los 241 MB serializados),
+    # y todos los procesos terminan compartiendo las mismas paginas del cache
+    # de disco del SO. y y beta_true son chicos y se cargan en RAM.
+    X = np.load(rutas["X"], mmap_mode="r")
+    y = np.load(rutas["y"])
+    beta_true = np.load(rutas["beta_true"])
+    return X, y, beta_true
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +140,9 @@ def intervalo_confianza(betas, nivel=0.95):
 
     Retorna (lo, hi), ambos de forma (k+1,).
     """
-    # TODO: np.percentile sobre axis=0 con [2.5, 97.5] derivados de 'nivel'.
-    raise NotImplementedError
+    cola = (1.0 - nivel) / 2.0 * 100.0
+    lo, hi = np.percentile(np.asarray(betas), [cola, 100.0 - cola], axis=0)
+    return lo, hi
 
 
 def semillas_resamples(seed=SEED, b=B):
@@ -111,8 +154,7 @@ def semillas_resamples(seed=SEED, b=B):
     scheduler despache las tareas. Compartir un unico RNG global entre procesos
     romperia la reproducibilidad.
     """
-    # TODO: np.random.SeedSequence(seed).spawn(b)
-    raise NotImplementedError
+    return np.random.SeedSequence(seed).spawn(b)
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +171,14 @@ def cronometrar(fn, repeticiones=3, descartar_warmup=True):
     Reportar la MEDIANA y no el promedio, porque este equipo es un notebook y el
     throttling termico produce outliers hacia arriba.
     """
-    # TODO: bucle con perf_counter; si descartar_warmup, correr fn() una vez antes.
-    raise NotImplementedError
+    if descartar_warmup:
+        fn()
+    tiempos = []
+    for _ in range(repeticiones):
+        t0 = time.perf_counter()
+        fn()
+        tiempos.append(time.perf_counter() - t0)
+    return tiempos
 
 
 def registrar_tiempo(version, variante, p, t, repeticion, tiempo_s, csv_path=CSV_TIEMPOS):
@@ -140,17 +188,47 @@ def registrar_tiempo(version, variante, p, t, repeticion, tiempo_s, csv_path=CSV
     Una fila por (version, variante, p, t, repeticion) para no perder la dispersion
     de las mediciones al agregar despues en plots.py.
     """
-    # TODO: abrir en modo 'a', escribir header si os.path.exists() es False.
-    raise NotImplementedError
+    carpeta = os.path.dirname(csv_path)
+    if carpeta:
+        os.makedirs(carpeta, exist_ok=True)
+    nuevo = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=COLUMNAS_CSV)
+        if nuevo:
+            writer.writeheader()
+        writer.writerow({
+            "maquina": nombre_maquina(),
+            "version": version,
+            "variante": variante,
+            "p": p,
+            "t": t,
+            "N": N,
+            "k": K,
+            "B": B,
+            "repeticion": repeticion,
+            "tiempo_s": f"{tiempo_s:.6f}",
+        })
 
 
 def leer_tiempos(csv_path=CSV_TIEMPOS):
     """Lee el CSV de tiempos y lo retorna como lista de dicts (lo consume plots.py)."""
-    # TODO: csv.DictReader, convirtiendo p/t/repeticion a int y tiempo_s a float.
-    raise NotImplementedError
+    filas = []
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for fila in csv.DictReader(f):
+            for col in ("p", "t", "N", "k", "B", "repeticion"):
+                fila[col] = int(fila[col])
+            fila["tiempo_s"] = float(fila["tiempo_s"])
+            filas.append(fila)
+    return filas
 
 
 if __name__ == "__main__":
     # Ejecutar este archivo directamente genera y cachea los datos del item (a).
-    # TODO: llamar cargar_datos(regenerar=True) e imprimir shapes + info_maquina().
-    pass
+    t0 = time.perf_counter()
+    X, y, beta_true = cargar_datos(regenerar=True)
+    print(f"Datos generados en {time.perf_counter() - t0:.1f} s (semilla {SEED})")
+    print(f"  X: {X.shape} {X.dtype}  ({X.nbytes / 1e6:.0f} MB)")
+    print(f"  y: {y.shape}   beta_true: {beta_true.shape}")
+    print("Ficha de la maquina:")
+    for clave, valor in info_maquina().items():
+        print(f"  {clave:14s} {valor}")
